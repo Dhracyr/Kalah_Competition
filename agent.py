@@ -1,48 +1,36 @@
-"""
-Kalah (KGP) agent: Alpha-beta (negamax) with stronger search engineering.
-
-Improvements over prior version:
-- Persistent transposition table / killer moves / history across *moves* (within a game).
-- Aspiration windows in iterative deepening.
-- Principal Variation Search (PVS) inside negamax for faster cutoffs.
-- Exact capture estimation for move ordering (derived from sow parameters + resulting store delta).
-- Stronger time usage (time_limit is a soft cap; server STOP is a hard cap).
-- Same rule correctness: uses kgp.Board.sow() for all transitions.
-
-This file expects a patched kgp.py that calls: agent(board, stop_evt)
-"""
-
 from __future__ import annotations
 
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import kgp
 from kgp import Board
 
+# -----------------------------
+# Configuration / constants
+# -----------------------------
 
-# ----------------------------
-# Search configuration
-# ----------------------------
+EXACT, LOWER, UPPER = 0, 1, 2
+PVS_EPS = 1e-6
+
 
 @dataclass(frozen=True)
 class SearchConfig:
+    """Search and evaluation configuration."""
     # Soft compute budget. The server can still stop us at any time via stop_evt.
     time_limit_s: float = 0.90
 
-    # Baseline depth ceiling (time dominates)
     max_depth: int = 22
 
-    # Endgame deepening (still time-bounded)
     endgame_stones_threshold: int = 24
     endgame_max_depth: int = 60
 
-    # Aspiration window around previous iteration score (in eval units)
+    # Aspiration window half-width around previous iteration score (in eval units).
     aspiration_window: float = 250.0
 
-    # Heuristic weights (stores dominate)
+    # Heuristic weights (stores dominate).
     w_store: float = 100.0
     w_pits: float = 1.0
     w_extra_turn: float = 3.0
@@ -51,32 +39,32 @@ class SearchConfig:
     use_transposition: bool = True
 
 
-EXACT, LOWER, UPPER = 0, 1, 2
-
-
 @dataclass
 class TTEntry:
+    """Transposition table entry."""
     depth: int
     value: float
     flag: int
     best_move: Optional[int]
 
 
-# ----------------------------
+# -----------------------------
 # Engine (persistent across moves)
-# ----------------------------
+# -----------------------------
 
 class AlphaBetaBoardEngine:
     """
-    Stateful engine that can be reused across many 'state' requests.
-    Keeps TT/killers/history across moves within a game for strength.
+    Stateful search engine that can be reused across move requests.
+
+    It keeps transposition table, killer moves and history heuristic across moves
+    within a game. It resets those structures when a new game start position is detected.
     """
 
     def __init__(self, cfg: SearchConfig):
         self.cfg = cfg
 
-        # Persistent structures
-        self._tt: Dict[Tuple, TTEntry] = {}
+        # Persistent structures (within a game)
+        self._tt: Dict[Tuple[int, ...], TTEntry] = {}
         self._killers: Dict[int, List[int]] = {}
         self._history: List[int] = [0] * 64
 
@@ -85,44 +73,39 @@ class AlphaBetaBoardEngine:
         self._start_time = 0.0
         self.nodes = 0
 
-        # Track last position to detect new games
+        # Used to detect a new game
         self._last_was_start = False
 
-    # ----------------------------
-    # Public interface
-    # ----------------------------
+    # ---- Public API ----
 
     def begin_search(self, board: Board, stop_evt) -> None:
-        """
-        Prepare engine for a new search on a new board.
-        May reset persistent structures if we detect a new game start.
-        """
+        """Initialize per-search state and reset persistent data if a new game is detected."""
         self.stop_evt = stop_evt
         self._start_time = time.time()
         self.nodes = 0
 
-        # Ensure history array is large enough for pit indices
         self._ensure_history_len(len(board.south_pits))
 
-        # Reset persistent structures if this looks like a new game start
         is_start = _is_start_position(board)
         if is_start and not self._last_was_start:
             self._tt.clear()
             self._killers.clear()
-            self._history = [0] * max(64, len(self._history))
+            for i in range(len(self._history)):
+                self._history[i] = 0
         self._last_was_start = is_start
 
-    def choose_moves_iterative(self, board: Board):
+    def iterative_best_moves(self, board: Board) -> Iterable[int]:
         """
-        Generator yielding improved best moves as depth increases.
-        Uses aspiration windows and yields after each completed depth.
+        Yield improving best moves as depth increases.
+
+        This is a generator; the caller may emit intermediate best moves to comply
+        with the KGP protocol expectations.
         """
         legal = board.legal_moves(kgp.SOUTH)
         if not legal:
             return
 
         depth_cap = self._depth_cap(board)
-
         best_move = legal[0]
         best_score = -math.inf
         prev_score: Optional[float] = None
@@ -139,37 +122,30 @@ class AlphaBetaBoardEngine:
 
             move, score = self._search_root(board, depth, alpha, beta)
 
-            # Aspiration fail -> re-search with full window
-            if not self._timed_out() and prev_score is not None and (score <= alpha or score >= beta):
+            # Aspiration failure => re-search with full window.
+            if (not self._timed_out()) and (prev_score is not None) and (score <= alpha or score >= beta):
                 move, score = self._search_root(board, depth, -math.inf, math.inf)
 
             if self._timed_out():
                 break
 
             prev_score = score
-
             if move in legal and (move != best_move or score > best_score):
                 best_move, best_score = move, score
                 yield best_move
 
-    # ----------------------------
-    # Root + negamax with PVS
-    # ----------------------------
+    # ---- Root search ----
 
     def _search_root(self, board: Board, depth: int, alpha: float, beta: float) -> Tuple[int, float]:
         legal = board.legal_moves(kgp.SOUTH)
         best_move = legal[0]
         best_score = -math.inf
 
-        # Root ordering uses same ordering but ply=0
-        moves = self._ordered_moves(board, ply=0)
-
-        for idx, move in enumerate(moves):
+        for move in self._ordered_moves(board, ply=0):
             if self._timed_out():
                 break
 
             child, repeat = board.sow(kgp.SOUTH, move, pure=True)
-
             if repeat:
                 score = self._negamax(child, depth - 1, alpha, beta, ply=1)
             else:
@@ -184,6 +160,8 @@ class AlphaBetaBoardEngine:
 
         return best_move, best_score
 
+    # ---- Negamax with PVS ----
+
     def _negamax(self, board: Board, depth: int, alpha: float, beta: float, ply: int) -> float:
         self.nodes += 1
 
@@ -195,7 +173,7 @@ class AlphaBetaBoardEngine:
 
         key = self._tt_key(board)
 
-        # TT probe with bounds
+        # TT probe (bounds)
         if self.cfg.use_transposition:
             entry = self._tt.get(key)
             if entry is not None and entry.depth >= depth:
@@ -214,7 +192,6 @@ class AlphaBetaBoardEngine:
 
         moves = self._ordered_moves(board, ply=ply)
 
-        # PVS: first move full window, others null-window then re-search if needed
         for i, move in enumerate(moves):
             if self._timed_out():
                 break
@@ -222,21 +199,10 @@ class AlphaBetaBoardEngine:
             child, repeat = board.sow(kgp.SOUTH, move, pure=True)
 
             if repeat:
-                if i == 0:
-                    val = self._negamax(child, depth - 1, alpha, beta, ply=ply + 1)
-                else:
-                    val = self._negamax(child, depth - 1, alpha, alpha + 1e-6, ply=ply + 1)
-                    if val > alpha and val < beta and not self._timed_out():
-                        val = self._negamax(child, depth - 1, alpha, beta, ply=ply + 1)
+                val = self._pvs_same_side(child, depth, alpha, beta, ply, is_first=(i == 0))
             else:
-                # swap to keep invariant "to-move is SOUTH" and negate
                 swapped = self._swap_perspective(child)
-                if i == 0:
-                    val = -self._negamax(swapped, depth - 1, -beta, -alpha, ply=ply + 1)
-                else:
-                    val = -self._negamax(swapped, depth - 1, -(alpha + 1e-6), -alpha, ply=ply + 1)
-                    if val > alpha and val < beta and not self._timed_out():
-                        val = -self._negamax(swapped, depth - 1, -beta, -alpha, ply=ply + 1)
+                val = -self._pvs_same_side(swapped, depth, -beta, -alpha, ply, is_first=(i == 0))
 
             if val > best_val:
                 best_val, best_move = val, move
@@ -258,9 +224,29 @@ class AlphaBetaBoardEngine:
 
         return best_val
 
-    # ----------------------------
+    def _pvs_same_side(
+        self,
+        board: Board,
+        depth: int,
+        alpha: float,
+        beta: float,
+        ply: int,
+        *,
+        is_first: bool,
+    ) -> float:
+        """PVS for a position where 'to-move is SOUTH' invariant already holds."""
+        if is_first:
+            return self._negamax(board, depth - 1, alpha, beta, ply=ply + 1)
+
+        # Null window first, then widen if it improves alpha.
+        val = self._negamax(board, depth - 1, alpha, alpha + PVS_EPS, ply=ply + 1)
+        if (val > alpha) and (val < beta) and (not self._timed_out()):
+            val = self._negamax(board, depth - 1, alpha, beta, ply=ply + 1)
+        return val
+
+    # -----------------------------
     # Move ordering
-    # ----------------------------
+    # -----------------------------
 
     def _ordered_moves(self, board: Board, ply: int) -> List[int]:
         moves = board.legal_moves(kgp.SOUTH)
@@ -272,7 +258,7 @@ class AlphaBetaBoardEngine:
         # 1) TT best move
         if self.cfg.use_transposition:
             entry = self._tt.get(self._tt_key(board))
-            if entry and entry.best_move in moves:
+            if entry and (entry.best_move in moves):
                 ordered.append(entry.best_move)
 
         # 2) Killer moves
@@ -280,54 +266,57 @@ class AlphaBetaBoardEngine:
             if km in moves and km not in ordered:
                 ordered.append(km)
 
+        # 3) Score the rest
         rest = [m for m in moves if m not in ordered]
         scored: List[Tuple[Tuple[int, int, int, int, float], int]] = []
 
         n = len(board.south_pits)
-
         for m in rest:
             child, repeat = board.sow(kgp.SOUTH, m, pure=True)
 
             store_delta = int(child.south - board.south)
-
-            # Exact estimate of stones placed into SOUTH store due to sowing laps
             stones = int(board.south_pits[m])
+
+            # Store passes from sowing laps; capture gain = store increase beyond those passes.
             passes = _store_passes(stones=stones, pit_index=m, n=n)
             capture_gain = max(0, store_delta - passes)
 
-            static = self._evaluate(child)
+            static_eval = self._evaluate(child)
             hist = self._history[m] if m < len(self._history) else 0
 
-            key = (
+            score_key = (
                 1 if repeat else 0,
                 capture_gain,
                 store_delta,
                 hist,
-                static,
+                static_eval,
             )
-            scored.append((key, m))
+            scored.append((score_key, m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         ordered.extend([m for _, m in scored])
         return ordered
 
     def _note_cutoff(self, move: int, depth: int, ply: int) -> None:
-        ks = self._killers.get(ply, [])
-        if move not in ks:
-            ks = [move] + ks
-            self._killers[ply] = ks[:2]
+        killers = self._killers.get(ply, [])
+        if move not in killers:
+            killers = [move] + killers
+            self._killers[ply] = killers[:2]
         if move < len(self._history):
             self._history[move] += depth * depth
 
-    # ----------------------------
+    # -----------------------------
     # Evaluation
-    # ----------------------------
+    # -----------------------------
 
     def _evaluate(self, board: Board) -> float:
+        """Static evaluation from SOUTH's perspective (positive is good for SOUTH)."""
         n = len(board.south_pits)
+
         store_diff = float(board.south - board.north)
         pit_diff = float(sum(board.south_pits) - sum(board.north_pits))
 
+        # Potential extra turns: if a move ends in SOUTH store.
         mod = 2 * n + 1
         extra_self = sum(
             1 for idx, stones in enumerate(board.south_pits)
@@ -348,9 +337,9 @@ class AlphaBetaBoardEngine:
             + self.cfg.w_capture * capture_term
         )
 
-    # ----------------------------
-    # Helpers
-    # ----------------------------
+    # -----------------------------
+    # Budget / misc helpers
+    # -----------------------------
 
     def _timed_out(self) -> bool:
         if self.stop_evt is not None and self.stop_evt.is_set():
@@ -364,11 +353,13 @@ class AlphaBetaBoardEngine:
         return self.cfg.max_depth
 
     def _ensure_history_len(self, n_pits: int) -> None:
-        if n_pits + 1 > len(self._history):
-            self._history.extend([0] * (n_pits + 1 - len(self._history)))
+        needed = n_pits + 1
+        if needed > len(self._history):
+            self._history.extend([0] * (needed - len(self._history)))
 
     @staticmethod
     def _swap_perspective(board: Board) -> Board:
+        """Swap NORTH/SOUTH to maintain the 'SOUTH to move' invariant in negamax."""
         return Board(
             south=board.north,
             north=board.south,
@@ -377,36 +368,25 @@ class AlphaBetaBoardEngine:
         )
 
     @staticmethod
-    def _tt_key(board: Board) -> Tuple:
-        return (tuple(board.south_pits), tuple(board.north_pits), int(board.south), int(board.north))
+    def _tt_key(board: Board) -> Tuple[int, ...]:
+        """Compact immutable key for transposition table."""
+        return (
+            *board.south_pits,
+            -1,  # separator
+            *board.north_pits,
+            -2,  # separator
+            int(board.south),
+            int(board.north),
+        )
 
-
-# ----------------------------
-# Opening book (small, safe)
-# ----------------------------
-
-def _book_move(board: Board) -> Optional[int]:
-    key = (tuple(board.south_pits), tuple(board.north_pits), int(board.south), int(board.north))
-
-    # (8,8) start -> pit 0 gives immediate extra turn.
-    start = ((8, 8, 8, 8, 8, 8, 8, 8), (8, 8, 8, 8, 8, 8, 8, 8), 0, 0)
-    after0 = ((0, 9, 9, 9, 9, 9, 9, 9), (8, 8, 8, 8, 8, 8, 8, 8), 1, 0)
-
-    book = {
-        start: 0,
-        after0: 1,
-    }
-    return book.get(key)
-
-
-# ----------------------------
+# -----------------------------
 # Utility heuristics
-# ----------------------------
+# -----------------------------
 
 def _store_passes(stones: int, pit_index: int, n: int) -> int:
     """
     Exact number of times a sow from SOUTH pit 'pit_index' drops a stone into SOUTH store,
-    assuming standard Kalah track length (2*n + 1) including SOUTH store.
+    assuming the standard Kalah track length (2*n + 1), including SOUTH store.
     """
     dist_to_store = n - pit_index
     if stones < dist_to_store:
@@ -417,12 +397,14 @@ def _store_passes(stones: int, pit_index: int, n: int) -> int:
 
 def _capture_potential_fast(board: Board) -> int:
     """
-    Cheap capture-bias heuristic (not rules-exact):
-    sums opponent stones opposite our empty pits that are plausibly reachable in one move.
+    Fast capture-bias heuristic (not rules-exact).
+
+    Sums opponent stones opposite our empty pits that are plausibly reachable in one move.
     """
     n = len(board.south_pits)
     south = board.south_pits
     north = board.north_pits
+
     moves = [i for i, s in enumerate(south) if s > 0]
     if not moves:
         return 0
@@ -431,26 +413,23 @@ def _capture_potential_fast(board: Board) -> int:
     for i in range(n):
         if south[i] != 0:
             continue
+
         opp = (n - 1) - i
         if north[opp] <= 0:
             continue
 
-        # Simple reachability: last stone lands on i from some j without wrap
-        reachable = any(south[j] == (i - j) for j in moves if i - j > 0)
-        if reachable:
+        # Simple reachability: last stone lands on i from some j without wrap-around.
+        if any(south[j] == (i - j) for j in moves if i - j > 0):
             value += north[opp]
+
     return value
 
 
 def _is_start_position(board: Board) -> bool:
-    """
-    Detects a fresh game start position for generic (m,n):
-    - stores are zero
-    - both sides have equal pits and all pits have the same stone count
-    """
+    """Detect a new game start position for generic (m, n)."""
     if int(board.south) != 0 or int(board.north) != 0:
         return False
-    if len(board.south_pits) == 0 or len(board.north_pits) == 0:
+    if not board.south_pits or not board.north_pits:
         return False
     if tuple(board.south_pits) != tuple(board.north_pits):
         return False
@@ -458,16 +437,16 @@ def _is_start_position(board: Board) -> bool:
     return all(x == first for x in board.south_pits)
 
 
-# ----------------------------
-# Global engine instance (persist across states)
-# ----------------------------
+# -----------------------------
+# Global engine (persist across states)
+# -----------------------------
 
 _ENGINE = AlphaBetaBoardEngine(SearchConfig())
 
 
-# ----------------------------
-# KGP agent generator
-# ----------------------------
+# -----------------------------
+# KGP agent entrypoint
+# -----------------------------
 
 def agent(board: Board, stop_evt):
     """
@@ -478,19 +457,17 @@ def agent(board: Board, stop_evt):
     if not legal:
         return
 
-    # Immediate book/fallback
-    bm = _book_move(board)
-    fallback = bm if (bm is not None and bm in legal) else legal[0]
-    yield fallback
+    # Provide a fast first move before not returning anything
+    yield legal[0]
 
     if stop_evt.is_set():
         return
 
-    # Search
+    # Search for improvements.
     _ENGINE.begin_search(board, stop_evt)
+    last = legal[0]
 
-    last = fallback
-    for best in _ENGINE.choose_moves_iterative(board):
+    for best in _ENGINE.iterative_best_moves(board):
         if stop_evt.is_set():
             return
         if best in legal and best != last:
@@ -501,6 +478,7 @@ def agent(board: Board, stop_evt):
 def main():
     kgp.connect(
         agent,
+        host="kalah.kwarc.info",
         name="Bigconda",
         authors=["Dhracyr"],
         # token="PUT_YOUR_REAL_TOKEN_HERE",
