@@ -1,14 +1,15 @@
-
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Tuple, Dict
 
 import math
 import time
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
-from kgp import Board
-
+# ----------------------------
+# Core Kalah representation
+# ----------------------------
 
 @dataclass(frozen=True)
 class KalahState:
@@ -16,10 +17,12 @@ class KalahState:
     Canonical Kalah board state for search.
 
     Layout convention:
-      - pits[0] belongs to the side-to-move agent (SOUTH in KGP).
-      - pits[1] belongs to the opponent (NORTH in KGP).
-      - stores[0] is our store (SOUTH), stores[1] is opponent store (NORTH).
-      - current_player: 0 or 1.
+      - Each player has N pits (typically N=6) and one store.
+      - pits[0] belongs to player 0, pits[1] belongs to player 1
+      - store[0], store[1] are the stores.
+      - current_player is 0 or 1.
+
+    pits[player][i] is pit i (0..N-1) for that player.
     """
     pits: Tuple[Tuple[int, ...], Tuple[int, ...]]
     stores: Tuple[int, int]
@@ -58,7 +61,9 @@ class KalahState:
         )
 
     def legal_moves(self) -> List[int]:
-        """Returns pit indices (0..N-1) playable by current player."""
+        """
+        Returns pit indices (0..N-1) playable by current player.
+        """
         cp = self.current_player
         return [i for i, stones in enumerate(self.pits[cp]) if stones > 0]
 
@@ -84,16 +89,20 @@ class KalahState:
         stones = pits[cp][pit_index]
         if stones <= 0:
             raise ValueError(f"Illegal move: pit {pit_index} is empty.")
+
         pits[cp][pit_index] = 0
 
-        pos_cp_side = True
-        idx = pit_index  # first drop is into next position
+        # We walk through positions in a fixed cycle:
+        # current player's pits pit_index+1..N-1, then current player's store,
+        # then opponent pits 0..N-1, then back to current player's pits 0..N-1, etc.
+        # Opponent store is skipped.
 
-        last_landed = ("pit", cp, pit_index)
+        pos_cp_side = True
+        idx = pit_index  # start from this pit, first drop is into next position
+
+        last_landed = ("pit", cp, pit_index)  # will be overwritten
         extra_turn = False
 
-
-        # Gameloop
         while stones > 0:
             # advance to next position
             if pos_cp_side:
@@ -126,7 +135,7 @@ class KalahState:
         if last_landed[0] == "store" and last_landed[1] == cp:
             extra_turn = True
 
-        # Capture
+        # Capture rule: last stone landed in own empty pit and opposite has stones
         if last_landed[0] == "pit":
             landed_player, landed_idx = last_landed[1], last_landed[2]
             if landed_player == cp and pits[cp][landed_idx] == 1:
@@ -147,7 +156,7 @@ class KalahState:
 
         return next_state
 
-    # --- evaluation ---
+    # --- evaluation (Stores evaluation) ---
     def stores_eval(self, perspective_player: int) -> int:
         """
         "Stores evaluation": store difference from perspective_player.
@@ -156,7 +165,10 @@ class KalahState:
         return self.stores[perspective_player] - self.stores[1 - perspective_player]
 
     def material_eval(self, perspective_player: int, pit_weight: float = 0.1) -> float:
-        """Stores diff + small pit diff (pit_weight should be small)."""
+        """
+        Slightly richer eval: stores diff + small pit diff.
+        Keep pit_weight small; stores dominate.
+        """
         s = float(self.stores_eval(perspective_player))
         pits_self = sum(self.pits[perspective_player])
         pits_opp = sum(self.pits[1 - perspective_player])
@@ -169,9 +181,9 @@ class KalahState:
 
 @dataclass
 class SearchConfig:
-    max_depth: int = 10
+    max_depth: int = 8
     use_iterative_deepening: bool = True
-    time_limit_s: Optional[float] = None  # no limit
+    time_limit_s: Optional[float] = None  # None = no limit
     use_transposition: bool = True
     pit_weight: float = 0.0  # 0.0 => pure Stores eval; >0 adds small pit term
 
@@ -184,7 +196,9 @@ class SearchResult:
 
 
 class AlphaBetaAgent:
-    """Alpha-beta pruning with negamax formulation and move ordering."""
+    """
+    Alpha-beta pruning with negamax formulation and move ordering.
+    """
 
     def __init__(self, cfg: SearchConfig):
         self.cfg = cfg
@@ -192,12 +206,15 @@ class AlphaBetaAgent:
         self._start_time: float = 0.0
 
     def choose_move(self, state: KalahState) -> SearchResult:
+        """
+        Returns best move for state.current_player.
+        """
         self._start_time = time.time()
         self._tt.clear()
 
         legal = state.legal_moves()
         if not legal:
-            # Defensive fallback (should not occur in valid Kalah positions)
+            # Should not happen in valid Kalah, but be safe.
             return SearchResult(move=0, score=-math.inf, depth_reached=0)
 
         best_move = legal[0]
@@ -220,13 +237,16 @@ class AlphaBetaAgent:
         return SearchResult(move=best_move, score=best_score, depth_reached=depth_reached)
 
     def _search_root(self, state: KalahState, depth: int) -> Tuple[int, float]:
+        """
+        Root search: returns (best_move, best_score).
+        """
         cp = state.current_player
         best_move = state.legal_moves()[0]
         best_score = -math.inf
         alpha = -math.inf
         beta = math.inf
 
-        for move in self._ordered_moves(state, player=cp):
+        for move in self._ordered_moves(state, cp):
             if self._timed_out():
                 break
 
@@ -249,6 +269,7 @@ class AlphaBetaAgent:
         perspective = player for whom the returned value is good when positive.
         """
         if self._timed_out():
+            # Conservative fallback: static eval at cutoff
             return self._evaluate(state, perspective)
 
         if depth <= 0 or state.is_terminal():
@@ -266,7 +287,7 @@ class AlphaBetaAgent:
         cp = state.current_player
         value = -math.inf
 
-        for move in self._ordered_moves(state, player=cp):
+        for move in self._ordered_moves(state, cp):
             if self._timed_out():
                 break
 
@@ -284,6 +305,9 @@ class AlphaBetaAgent:
         return value
 
     def _evaluate(self, state: KalahState, perspective: int) -> float:
+        """
+        Stores evaluation, optionally with a small pit term.
+        """
         if self.cfg.pit_weight == 0.0:
             return float(state.stores_eval(perspective))
         return float(state.material_eval(perspective, pit_weight=self.cfg.pit_weight))
@@ -292,21 +316,34 @@ class AlphaBetaAgent:
         """
         Move ordering:
           1) Prefer extra-turn moves
-          2) Prefer capture moves (approx by store delta)
-          3) Prefer higher static evaluation after the move
+          2) Prefer capture moves
+          3) Then prefer moves with better static eval after move
+
+        This significantly improves alpha-beta pruning in Kalah.
         """
         moves = state.legal_moves()
-        scored: List[Tuple[Tuple[int, int, float], int]] = []
 
+        scored: List[Tuple[Tuple[int, int, float], int]] = []
         for m in moves:
             child = state.apply_move(m)
+
             extra_turn = 1 if child.current_player == player else 0
-            capture = child.stores[player] - state.stores[player]
+            capture = self._capture_delta(state, child, player)
             static = self._evaluate(child, player)
+
+            # Sort descending by (extra_turn, capture, static)
             scored.append(((extra_turn, capture, static), m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [m for _, m in scored]
+
+    @staticmethod
+    def _capture_delta(parent: KalahState, child: KalahState, player: int) -> int:
+        """
+        Approximate "capture amount" by store increase (beyond normal sowing).
+        Not perfect, but strong enough for ordering.
+        """
+        return child.stores[player] - parent.stores[player]
 
     def _timed_out(self) -> bool:
         if self.cfg.time_limit_s is None:
@@ -315,49 +352,96 @@ class AlphaBetaAgent:
 
     @staticmethod
     def _tt_key(state: KalahState, perspective: int) -> Tuple:
+        # perspective is included so the score meaning stays consistent.
         return (state.pits, state.stores, state.current_player, perspective)
 
 
 # ----------------------------
-# KGP integration
+# pykgp integration (adapter)
 # ----------------------------
 
-def board_to_state(board: Board) -> KalahState:
+class PyKGPStateAdapter:
     """
-    Convert kgp.Board -> internal KalahState.
+    Adapter stub: convert pykgp's state object into our KalahState.
 
-    KGP provides `south_pits`, `north_pits`, `south`, `north`.
-    The server ensures we act as SOUTH (our pits/stores are "south_*").
+    You MUST adjust these two methods according to pykgp's actual state representation.
+    The alpha-beta implementation above stays unchanged.
     """
-    pits_self = tuple(int(x) for x in board.south_pits)
-    pits_opp = tuple(int(x) for x in board.north_pits)
-    store_self = int(board.south)
-    store_opp = int(board.north)
+
+    @staticmethod
+    def from_pykgp(py_state) -> KalahState:
+        """
+        Expected to extract:
+          - pits for both players as tuples of ints length N
+          - stores for both players
+          - current player index (0/1)
+        """
+        # ---- EXAMPLE ASSUMPTIONS (edit this) ----
+        # Many Kalah libraries store:
+        #   py_state.pits[0], py_state.pits[1]  (lists length N)
+        #   py_state.stores[0], py_state.stores[1]
+        #   py_state.player_to_move  (0/1)
+        pits0 = tuple(py_state.pits[0])
+        pits1 = tuple(py_state.pits[1])
+        stores = (int(py_state.stores[0]), int(py_state.stores[1]))
+        current = int(py_state.player_to_move)
+        # ----------------------------------------
+        return KalahState(pits=(pits0, pits1), stores=stores, current_player=current)
+
+    @staticmethod
+    def to_pykgp_move(move: int):
+        """
+        Convert our move (0..N-1 pit index) to whatever pykgp expects.
+        Often it's just an int pit index; sometimes 1..N indexing.
+        """
+        return move  # edit if pykgp uses 1-based pits, etc.
+
+from kgp import NORTH, SOUTH, Board
+
+def board_to_state(board: Board):
+    """
+    Convert kgp.Board → internal KalahState
+    Always from the perspective of the side to move.
+    """
+    # In KGP, the agent is always asked to move for "its" side.
+    # By convention, that side is SOUTH.
+    # (The server flips boards when needed.)
+    current_player = 0  # we always treat ourselves as player 0
+
+    pits_self = tuple(board.south_pits)
+    pits_opp  = tuple(board.north_pits)
+
+    store_self = board.south
+    store_opp  = board.north
 
     return KalahState(
         pits=(pits_self, pits_opp),
         stores=(store_self, store_opp),
-        current_player=0,  # our turn when agent() is called
+        current_player=current_player,
     )
 
-
-# Build a single reusable searcher instance to reduce per-move overhead.
-_CFG = SearchConfig(
-    max_depth=10,
-    use_iterative_deepening=True,
-    time_limit_s=0.8,
-    use_transposition=True,
-    pit_weight=0.0,
-)
-_SEARCHER = AlphaBetaAgent(_CFG)
-
+# ----------------------------
+# Example agent function
+# ----------------------------
 
 def agent(board: Board):
     """
-    KGP agent entry point.
-
-    Receives a kgp.Board and yields exactly one 0-based pit index.
+    KGP agent generator.
+    Receives a Board, yields 0-based pit indices.
     """
     state = board_to_state(board)
-    result = _SEARCHER.choose_move(state)
+
+    cfg = SearchConfig(
+        max_depth=10,
+        use_iterative_deepening=True,
+        time_limit_s=0.8,   # safe for practice server
+        use_transposition=True,
+        pit_weight=0.0,     # pure Stores evaluation (as requested)
+    )
+
+    searcher = AlphaBetaAgent(cfg)
+    result = searcher.choose_move(state)
+
+    # Yield exactly one move
     yield result.move
+
